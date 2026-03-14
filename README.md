@@ -22,6 +22,16 @@ A pre-built Windows executable is available — no Python installation required.
 
 ---
 
+## Screenshots
+
+**TIC (Total Ion Chromatogram)**
+![TIC](docs/tic_chromatogram.png)
+
+**XIC (Extracted Ion Chromatogram)**
+![XIC](docs/xic_chromatogram.png)
+
+---
+
 ## Features
 
 - **TIC / BPI** for MS1 and MS2
@@ -94,7 +104,10 @@ C:\Data\sample.d
 timstof_chromatogram/
 ├── timstof_chromatogram.py   # Main application
 ├── timsTOF_viewer.spec       # PyInstaller build spec
-└── build.bat                 # Windows build script
+├── build.bat                 # Windows build script
+└── docs/
+    ├── tic_chromatogram.png
+    └── xic_chromatogram.png
 ```
 
 ## License
