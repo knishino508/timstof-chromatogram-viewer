@@ -98,6 +98,16 @@ C:\timsTOF_Viewer\timsTOF_Viewer.exe
 C:\Data\sample.d
 ```
 
+## Development
+
+This project was developed by a timsTOF operator (non-engineer) with the assistance of AI.
+
+| Version | AI Model |
+|---------|----------|
+| v1.0.0 | Claude Sonnet 4.6 (Anthropic) |
+
+Code quality and functionality are best evaluated by actually running the tool.
+
 ## File Structure
 
 ```
