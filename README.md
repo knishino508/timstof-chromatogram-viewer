@@ -46,7 +46,7 @@ A pre-built Windows executable is available — no Python installation required.
 ## Requirements (for running from source)
 
 - **Python 3.11** (opentimspy does not work with Python 3.12 or later)
-- [opentimspy](https://github.com/MatteoLacki/opentimspy)
+- [opentims](https://github.com/michalsta/opentims)
 - PyQt6
 - pyqtgraph
 - numpy
