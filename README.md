@@ -6,7 +6,7 @@ A fast, interactive chromatogram viewer for Bruker timsTOF data (`.d` folders), 
 
 A pre-built Windows executable is available — no Python installation required.
 
-👉 **[Download timsTOF_Viewer.zip](https://www.dropbox.com/scl/fi/oxkzn978jr1jjex6nhtgd/timstof_chromatgram_viewer_v1.0.0.zip?rlkey=4s29whsowtbcfffjj4ki0yzkk&st=0ggn05nr&dl=1)**
+👉 **[Download timsTOF_Viewer.zip](https://www.dropbox.com/scl/fi/0jm38f4mpgz92q5pv9ywa/timstof_chromatgram_viewer_v1.1.zip?rlkey=tsbqx5nth7by5p3c4jiyws0h9&st=xogov79q&dl=1)**
 
 ### Installation
 
