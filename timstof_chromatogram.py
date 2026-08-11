@@ -1,6 +1,7 @@
 # main_en.py
 import sys
 import csv
+import re
 import time
 from pathlib import Path
 import numpy as np
@@ -9,11 +10,162 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QLabel, QDoubleSpinBox, QSpinBox,
     QGroupBox, QListWidget, QListWidgetItem, QCheckBox, QScrollArea,
-    QDialog, QDialogButtonBox, QFrame, QSizePolicy
+    QDialog, QDialogButtonBox, QFrame, QSizePolicy, QSplitter, QColorDialog
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QFont, QColor
 import pyqtgraph as pg
+
+
+# ファイルごとのライン色の既定パレット
+PALETTE = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+           '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+           '#FF6600', '#9900FF', '#00CC99', '#FF0066', '#6600FF']
+
+
+class FileListRow(QWidget):
+    """ファイルリストの1行ウィジェット: [チェックボックス][色ボタン][ファイル名]"""
+
+    def __init__(self, path, color, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self._color = color
+        self._full_text = path.name
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(2, 1, 2, 1)
+        lay.setSpacing(5)
+
+        self.check = QCheckBox()
+        self.check.setToolTip("プロットに表示する")
+        lay.addWidget(self.check)
+
+        self.color_btn = QPushButton()
+        self.color_btn.setFixedSize(16, 16)
+        self.color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.color_btn.setToolTip("クリックしてライン色を変更")
+        lay.addWidget(self.color_btn)
+
+        self.label = QLabel()
+        self.label.setToolTip(str(path))
+        self.label.setMinimumWidth(20)
+        self.label.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                 QSizePolicy.Policy.Preferred)
+        lay.addWidget(self.label, 1)
+
+        self._apply_color()
+        self._update_elide()
+
+    # ── 色 ──────────────────────────────────────────────────────
+    def color(self) -> str:
+        return self._color
+
+    def set_color(self, color: str):
+        self._color = color
+        self._apply_color()
+
+    def _apply_color(self):
+        self.color_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {self._color};"
+            f" border: 1px solid #555; border-radius: 3px; }}"
+            f"QPushButton:hover {{ border: 2px solid #000; }}"
+        )
+
+    # ── チェック状態 ────────────────────────────────────────────
+    def is_checked(self) -> bool:
+        return self.check.isChecked()
+
+    def set_checked(self, checked: bool):
+        self.check.setChecked(bool(checked))
+
+    # ── ファイル名の省略表示 ────────────────────────────────────
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._update_elide()
+
+    def _update_elide(self):
+        fm = self.label.fontMetrics()
+        w = max(self.label.width(), 20)
+        self.label.setText(
+            fm.elidedText(self._full_text, Qt.TextElideMode.ElideMiddle, w)
+        )
+
+
+class ClampedViewBox(pg.ViewBox):
+    """Y軸の下限を0に固定し、上限のみを拡大縮小できるViewBox。
+
+    正規化済み（0–100%）プロット専用。
+
+    操作
+    ----
+    ホイール              : Y軸スケーリング（下端は常に0）
+    Ctrl / Shift + ホイール : X軸ズーム（従来のホイール動作）
+    矩形ドラッグ           : X軸のみズーム（Y範囲は維持）
+    """
+
+    Y_TOP_MIN = 0.5      # 拡大の限界（0–0.5%）
+    Y_TOP_MAX = 105.0    # 縮小の限界（初期値）
+
+    sigYTopChanged = pyqtSignal(float)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._y_top = self.Y_TOP_MAX
+        self._enforcing = False
+        self.setMouseEnabled(x=True, y=False)
+        self.enableAutoRange(axis='y', enable=False)
+        self.setYRange(0, self._y_top, padding=0)
+        self.sigRangeChanged.connect(self._enforce_y)
+
+    # ── Y軸上限の管理 ────────────────────────────────────────────
+    def y_top(self) -> float:
+        return self._y_top
+
+    def set_y_top(self, top: float, emit: bool = True):
+        """Y軸上限を設定（0 が常に下端、Y_TOP_MIN〜Y_TOP_MAX にクランプ）"""
+        top = float(min(max(top, self.Y_TOP_MIN), self.Y_TOP_MAX))
+        if abs(top - self._y_top) < 1e-9:
+            return
+        self._y_top = top
+        self._apply_y()
+        if emit:
+            self.sigYTopChanged.emit(top)
+
+    def _apply_y(self):
+        self._enforcing = True
+        try:
+            self.setYRange(0, self._y_top, padding=0)
+        finally:
+            self._enforcing = False
+
+    def _enforce_y(self, *args):
+        """矩形ズーム等でY範囲が動いた場合に 0–_y_top へ引き戻す"""
+        if self._enforcing:
+            return
+        try:
+            (_, _), (y0, y1) = self.viewRange()
+        except (ValueError, TypeError):
+            return
+        if abs(y0) > 1e-9 or abs(y1 - self._y_top) > 1e-9:
+            self._apply_y()
+
+    # ── ホイール ────────────────────────────────────────────────
+    def wheelEvent(self, ev, axis=None):
+        mods = ev.modifiers()
+        if mods & (Qt.KeyboardModifier.ControlModifier |
+                   Qt.KeyboardModifier.ShiftModifier):
+            super().wheelEvent(ev, axis=0)   # X軸ズーム（従来動作）
+            return
+
+        try:
+            delta = ev.delta()
+        except AttributeError:
+            delta = ev.angleDelta().y()
+
+        # pyqtgraph 標準と同じスケーリング則（上スクロール = 拡大）
+        s = 1.02 ** (delta * self.state['wheelScaleFactor'])
+        self.set_y_top(self._y_top * s)
+        ev.accept()
 
 
 class DataContainer:
@@ -21,6 +173,7 @@ class DataContainer:
     def __init__(self, path):
         self.path = path
         self.name = path.name
+        self.color = None   # ライン色（ChromatogramViewer が割り当てる）
         self.D = None
         self.ms1_ids = None
         self.ms2_ids = None
@@ -166,22 +319,42 @@ class ChromatogramViewer(QMainWindow):
         self.plot_height = 150
         self.current_plots = []
 
+        # ファイルリストのソート状態
+        self._sort_mode = None     # None = 読み込み順 / 'name' / 'run'
+        self._sort_desc = False    # False = 昇順, True = 降順
+
+        # Y軸スケーリング状態（0を下限に固定し、上限のみ可変）
+        self._y_top        = ClampedViewBox.Y_TOP_MAX
+        self._clamped_vbs  = []      # 現在表示中の ClampedViewBox
+        self._y_sync_guard = False   # 同期時の再帰防止
+
         # Persistent settings (survive dialog close)
         self.multi_xic_mz_list       = []
         self.multi_xic_tol_list      = []
         self.multi_xic_rt_list       = []
         self.multi_xic_rt_width_list = []
 
-        # === Central widget: 3-pane layout ===
+        # === Central widget: 3-pane resizable layout ===
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
+        # ドラッグで幅を変えられる3ペイン
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(6)
+        self.splitter.setStyleSheet(
+            "QSplitter::handle { background: #d0d0d0; }"
+            "QSplitter::handle:hover { background: #7ab3e8; }"
+        )
+        main_layout.addWidget(self.splitter)
+
         # ── LEFT PANEL ──────────────────────────────────────────
         left_panel = QWidget()
-        left_panel.setFixedWidth(200)
+        left_panel.setMinimumWidth(150)
+        left_panel.setMaximumWidth(700)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(6, 6, 6, 6)
         left_layout.setSpacing(4)
@@ -213,9 +386,52 @@ class ChromatogramViewer(QMainWindow):
         sel_btn_layout.addWidget(self.select_all_btn)
         sel_btn_layout.addWidget(self.deselect_all_btn)
         list_layout.addLayout(sel_btn_layout)
+
+        # Sort buttons
+        sort_btn_layout = QHBoxLayout()
+        sort_btn_layout.setSpacing(2)
+        sort_btn_layout.addWidget(QLabel("Sort:"))
+
+        self.sort_name_btn = QPushButton("Name")
+        self.sort_name_btn.setToolTip(
+            "フォルダ名の文字列順に並べ替えます。\n"
+            "（大文字小文字を区別しない単純比較）"
+        )
+        self.sort_name_btn.clicked.connect(lambda: self._sort_file_list('name'))
+        sort_btn_layout.addWidget(self.sort_name_btn)
+
+        self.sort_run_btn = QPushButton("Run #")
+        self.sort_run_btn.setToolTip(
+            "測定順に並べ替えます。\n"
+            "フォルダ名末尾の数値を使用します。\n"
+            "例: ..._Slot2-3_1_10194.d → 10194\n"
+            "数値が取れないファイルは末尾にまとめます。"
+        )
+        self.sort_run_btn.clicked.connect(lambda: self._sort_file_list('run'))
+        sort_btn_layout.addWidget(self.sort_run_btn)
+
+        self.sort_dir_btn = QPushButton("▲")
+        self.sort_dir_btn.setFixedWidth(26)
+        self.sort_dir_btn.setToolTip("昇順 / 降順の切り替え")
+        self.sort_dir_btn.clicked.connect(self._toggle_sort_direction)
+        sort_btn_layout.addWidget(self.sort_dir_btn)
+
+        list_layout.addLayout(sort_btn_layout)
+
+        self.reset_colors_btn = QPushButton("Reset Colors")
+        self.reset_colors_btn.setToolTip(
+            "全ファイルのライン色を既定パレットに戻します。\n"
+            "（現在のリストの並び順で割り当て直します）"
+        )
+        self.reset_colors_btn.clicked.connect(self._reset_colors)
+        list_layout.addWidget(self.reset_colors_btn)
+
         self.file_list = QListWidget()
+        # 名前が長い場合は中央を省略（末尾の測定番号を残す）+ 全文はツールチップで
+        self.file_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.file_list.setMinimumHeight(120)
         list_layout.addWidget(self.file_list)
-        left_layout.addWidget(list_group)
+        left_layout.addWidget(list_group, 1)   # ファイルリストを縦に伸ばす
 
         # ── Mode buttons ──
         mode_group = QGroupBox("Chromatogram")
@@ -277,9 +493,7 @@ class ChromatogramViewer(QMainWindow):
         status_layout.addWidget(self.status_label)
         left_layout.addWidget(status_group)
 
-        left_layout.addStretch()
-
-        main_layout.addWidget(left_panel)
+        self.splitter.addWidget(left_panel)
 
         # ── PLOT AREA ────────────────────────────────────────────
         self.scroll_area = QScrollArea()
@@ -289,11 +503,13 @@ class ChromatogramViewer(QMainWindow):
         self.plot_container = pg.GraphicsLayoutWidget()
         self.plot_container.setBackground('w')
         self.scroll_area.setWidget(self.plot_container)
-        main_layout.addWidget(self.scroll_area)
+        self.scroll_area.setMinimumWidth(200)
+        self.splitter.addWidget(self.scroll_area)
 
         # ── RIGHT PANEL (Display settings) ───────────────────────
         right_panel = QWidget()
-        right_panel.setFixedWidth(170)
+        right_panel.setMinimumWidth(150)
+        right_panel.setMaximumWidth(500)
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(6, 6, 6, 6)
         right_layout.setSpacing(4)
@@ -315,6 +531,28 @@ class ChromatogramViewer(QMainWindow):
         self.line_width_input.valueChanged.connect(self._update_line_width)
         lw_layout.addWidget(self.line_width_input)
         disp_layout.addLayout(lw_layout)
+
+        # Y-axis top (0 is always the bottom)
+        yt_layout = QHBoxLayout()
+        yt_layout.addWidget(QLabel("Y max:"))
+        self.y_top_input = QDoubleSpinBox()
+        self.y_top_input.setRange(ClampedViewBox.Y_TOP_MIN, ClampedViewBox.Y_TOP_MAX)
+        self.y_top_input.setDecimals(1)
+        self.y_top_input.setSingleStep(5.0)
+        self.y_top_input.setValue(self._y_top)
+        self.y_top_input.setSuffix(" %")
+        self.y_top_input.setToolTip(
+            "Y軸の上限（下限は常に0）。\n"
+            "プロット上でホイールを回しても変更できます。\n"
+            "Ctrl / Shift + ホイール = X軸ズーム。"
+        )
+        self.y_top_input.valueChanged.connect(self._set_y_top_from_ui)
+        yt_layout.addWidget(self.y_top_input)
+        disp_layout.addLayout(yt_layout)
+
+        self.y_reset_btn = QPushButton("Reset Y (0–105%)")
+        self.y_reset_btn.clicked.connect(self._reset_y_top)
+        disp_layout.addWidget(self.y_reset_btn)
 
         right_layout.addWidget(disp_group)
 
@@ -349,15 +587,17 @@ class ChromatogramViewer(QMainWindow):
         right_layout.addWidget(rtqc_disp_group)
         right_layout.addStretch()
 
-        main_layout.addWidget(right_panel)
+        self.splitter.addWidget(right_panel)
 
-        # Stretch: left=0 (fixed), center=1 (expand), right=0 (fixed)
-        main_layout.setStretch(0, 0)
-        main_layout.setStretch(1, 1)
-        main_layout.setStretch(2, 0)
+        # プロット領域だけが伸縮し、両サイドはドラッグ幅を保持
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 0)
+        self.splitter.setSizes([220, max(w - 220 - 170, 300), 170])
 
         # Storage for live-update
-        self._current_plot_items = []  # (PlotDataItem, color) for line width update
+        self._current_plot_items = []  # (PlotDataItem, path|None) for line width update
+        self._file_plot_items    = {}  # {path: [PlotDataItem, ...]} for color update
         self._rtqc_redlines      = []  # (InfiniteLine, plot) for show/hide
 
         # Hidden storage widgets (kept for logic compatibility)
@@ -563,16 +803,13 @@ class ChromatogramViewer(QMainWindow):
         for d_folder in d_folders:
             if d_folder not in self.data_dict:
                 # Create DataContainer (don't load yet)
-                self.data_dict[d_folder] = DataContainer(d_folder)
-                
-                # Add to list (with checkbox)
-                item = QListWidgetItem(d_folder.name)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Unchecked)
-                item.setData(Qt.ItemDataRole.UserRole, d_folder)  # Save path
-                self.file_list.addItem(item)
+                data = DataContainer(d_folder)
+                data.color = PALETTE[len(self.data_dict) % len(PALETTE)]
+                self.data_dict[d_folder] = data
+                self._add_file_item(d_folder, checked=False)
                 added_count += 1
         
+        self._sort_file_list()  # ソート指定中なら維持
         self.status_label.setText(f"Added: {added_count} files\nTotal: {self.file_list.count()} files")
         
     def load_single_folder(self):
@@ -598,44 +835,217 @@ class ChromatogramViewer(QMainWindow):
             return
         
         # Create DataContainer
-        self.data_dict[folder_path] = DataContainer(folder_path)
+        data = DataContainer(folder_path)
+        data.color = PALETTE[len(self.data_dict) % len(PALETTE)]
+        self.data_dict[folder_path] = data
+        self._add_file_item(folder_path, checked=True)
         
-        # Add to list (with checkbox, checked by default)
-        item = QListWidgetItem(folder_path.name)
-        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        item.setCheckState(Qt.CheckState.Checked)
-        item.setData(Qt.ItemDataRole.UserRole, folder_path)
-        self.file_list.addItem(item)
-        
+        self._sort_file_list()  # ソート指定中なら維持
         self.status_label.setText(f"Added:\n{folder_path.name}")
         
+    # ── ファイルリストの行 ──────────────────────────────────────
+
+    def _add_file_item(self, path, checked=False):
+        """リストに1行追加する（チェックボックス + 色ボタン + ファイル名）"""
+        data = self.data_dict.get(path)
+        color = data.color if (data and data.color) else PALETTE[0]
+
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        self.file_list.addItem(item)
+
+        row = FileListRow(path, color)
+        row.set_checked(checked)
+        row.color_btn.clicked.connect(lambda _=False, p=path: self._pick_color(p))
+        item.setSizeHint(row.sizeHint())
+        self.file_list.setItemWidget(item, row)
+        return item
+
+    def _row_widget(self, index):
+        """index行の FileListRow を返す（無ければ None）"""
+        item = self.file_list.item(index)
+        return self.file_list.itemWidget(item) if item else None
+
+    def _pick_color(self, path):
+        """色ボタン押下 → カラーピッカーを開き、選択色を即座に反映"""
+        data = self.data_dict.get(path)
+        if data is None:
+            return
+
+        current = QColor(data.color or PALETTE[0])
+        chosen = QColorDialog.getColor(
+            current, self, f"Line color – {path.name}"
+        )
+        if not chosen.isValid():
+            return
+
+        new_color = chosen.name()   # '#rrggbb'
+        data.color = new_color
+
+        # リスト上のスウォッチを更新
+        for i in range(self.file_list.count()):
+            if self.file_list.item(i).data(Qt.ItemDataRole.UserRole) == path:
+                row = self._row_widget(i)
+                if row is not None:
+                    row.set_color(new_color)
+                break
+
+        # 描画済みのラインにも即座に反映（再計算なし）
+        self._apply_color_to_plots(path, new_color)
+
+    def _apply_color_to_plots(self, path, color):
+        """描画済みの PlotDataItem のペン色だけを差し替える"""
+        items = self._file_plot_items.get(path, [])
+        for item in items:
+            pen = item.opts.get('pen')
+            if pen is None:
+                continue
+            new_pen = pg.mkPen(color=color, width=pen.width(), style=pen.style())
+            item.setPen(new_pen)
+
+    def _reset_colors(self):
+        """全ファイルの色を既定パレットに戻す（現在のリスト順で割り当て）"""
+        n = self.file_list.count()
+        for i in range(n):
+            path = self.file_list.item(i).data(Qt.ItemDataRole.UserRole)
+            data = self.data_dict.get(path)
+            if data is None:
+                continue
+            color = PALETTE[i % len(PALETTE)]
+            data.color = color
+            row = self._row_widget(i)
+            if row is not None:
+                row.set_color(color)
+            self._apply_color_to_plots(path, color)
+        self.status_label.setText(f"Colors reset ({n} files)")
+
     def get_checked_paths(self):
         """Get list of checked file paths"""
         checked = []
         for i in range(self.file_list.count()):
-            item = self.file_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                path = item.data(Qt.ItemDataRole.UserRole)
-                checked.append(path)
+            row = self._row_widget(i)
+            if row is not None and row.is_checked():
+                checked.append(self.file_list.item(i).data(Qt.ItemDataRole.UserRole))
         return checked
     
     def select_all(self):
         """Select all"""
         for i in range(self.file_list.count()):
-            self.file_list.item(i).setCheckState(Qt.CheckState.Checked)
+            row = self._row_widget(i)
+            if row is not None:
+                row.set_checked(True)
     
     def deselect_all(self):
         """Deselect all"""
         for i in range(self.file_list.count()):
-            self.file_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+            row = self._row_widget(i)
+            if row is not None:
+                row.set_checked(False)
     
     def clear_all(self):
         """Clear all data"""
         self.data_dict.clear()
         self.file_list.clear()
-        self.plot_container.clear()
+        self._clear_plot_area()
         self.status_label.setText("Cleared")
-    
+
+    # ── ファイルリストのソート ──────────────────────────────────
+
+    _RUN_NUM_RE = re.compile(r'_(\d+)\s*$')
+
+    @staticmethod
+    def _run_number(name: str):
+        """フォルダ名末尾の測定番号を取り出す。
+
+        Bruker の生データは末尾の `_<数値>.d` が測定の通し番号になっている。
+        例: HeLaQC_40min_200ng_DDA_Slot2-3_1_10194.d → 10194
+
+        Returns
+        -------
+        int または None（数値が取れない場合）
+        """
+        stem = name[:-2] if name.lower().endswith('.d') else name
+        m = ChromatogramViewer._RUN_NUM_RE.search(stem)
+        return int(m.group(1)) if m else None
+
+    def _sort_file_list(self, mode=None):
+        """ファイルリストを並べ替える（チェック状態は維持）
+
+        mode : 'name' = フォルダ名の文字列順
+               'run'  = 末尾の測定番号順
+               None   = 現在のモードで再ソート（新規追加時などに使用）
+        """
+        if mode is not None:
+            self._sort_mode = mode
+        if self._sort_mode is None:
+            return
+
+        n = self.file_list.count()
+        if n == 0:
+            self._update_sort_buttons()
+            return
+
+        # 現在の項目を退避（パス・チェック状態・表示名）
+        rows = []
+        for i in range(n):
+            item = self.file_list.item(i)
+            row  = self._row_widget(i)
+            path = item.data(Qt.ItemDataRole.UserRole)
+            rows.append((
+                path,
+                row.is_checked() if row is not None else False,
+                path.name,
+            ))
+
+        if self._sort_mode == 'name':
+            rows.sort(key=lambda r: r[2].lower(), reverse=self._sort_desc)
+            unresolved = []
+        else:  # 'run'
+            # 測定番号が取れたものだけ並べ替え、取れないものは常に末尾へ
+            resolved   = [r for r in rows if self._run_number(r[2]) is not None]
+            unresolved = [r for r in rows if self._run_number(r[2]) is None]
+            resolved.sort(key=lambda r: self._run_number(r[2]),
+                          reverse=self._sort_desc)
+            unresolved.sort(key=lambda r: r[2].lower())
+            rows = resolved + unresolved
+
+        # リストを再構築（色・チェック状態は維持）
+        self.file_list.clear()
+        for path, checked, _text in rows:
+            self._add_file_item(path, checked=checked)
+
+        self._update_sort_buttons()
+
+        order = "descending" if self._sort_desc else "ascending"
+        label = "name" if self._sort_mode == 'name' else "run number"
+        msg = f"Sorted by {label} ({order})"
+        if unresolved:
+            msg += f"\n{len(unresolved)} file(s) without a run number moved to the end"
+        if self.current_plots:
+            msg += "\nRe-run the plot to apply the new order"
+        self.status_label.setText(msg)
+
+    def _toggle_sort_direction(self):
+        """昇順 / 降順を切り替えて再ソート"""
+        self._sort_desc = not self._sort_desc
+        if self._sort_mode is None:
+            # モード未選択なら名前順から開始
+            self._sort_file_list('name')
+        else:
+            self._sort_file_list()
+
+    def _update_sort_buttons(self):
+        """ソートボタンの表示状態を更新"""
+        self.sort_dir_btn.setText("▼" if self._sort_desc else "▲")
+
+        active   = "QPushButton { font-weight: bold; background: #cce4ff; }"
+        inactive = ""
+        self.sort_name_btn.setStyleSheet(
+            active if self._sort_mode == 'name' else inactive)
+        self.sort_run_btn.setStyleSheet(
+            active if self._sort_mode == 'run' else inactive)
+
+
     def calculate_bpi(self, data):
         """Calculate BPI (loaded from db.frames['MaxIntensity'] at load time)"""
         # data.bpi はロード時に db.frames['MaxIntensity'] から既にキャッシュ済み
@@ -989,7 +1399,7 @@ class ChromatogramViewer(QMainWindow):
         """RT QC plot implementation using per-run RT windows."""
         checked_paths = self.get_checked_paths()
         if not checked_paths:
-            self.plot_container.clear()
+            self._clear_plot_area()
             self.status_label.setText("Please select files")
             return
 
@@ -1020,11 +1430,7 @@ class ChromatogramViewer(QMainWindow):
         overlay      = self.overlay_check.isChecked()
         n_peptides   = len(selected)
 
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-                  '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
-                  '#FF6600', '#9900FF', '#00CC99', '#FF0066', '#6600FF']
-
-        self.plot_container.clear()
+        self._clear_plot_area()
 
         # --- Overlay mode: single plot, all files × all peptides ---
         # Color = file, each peptide drawn in the same file color
@@ -1032,7 +1438,7 @@ class ChromatogramViewer(QMainWindow):
         if overlay:
             self.plot_container.setMinimumHeight(0)
 
-            plot = self.plot_container.addPlot(row=0, col=0)
+            plot = self.plot_container.addPlot(row=0, col=0, viewBox=ClampedViewBox())
             plot.setTitle("RT QC – Overlay", size="10pt")
             plot.setLabel('left', '%')
             plot.setLabel('bottom', 'Retention Time (min)')
@@ -1046,8 +1452,8 @@ class ChromatogramViewer(QMainWindow):
             all_max    = []
 
             for i, data in enumerate(data_list):
-                color = colors[i % len(colors)]
-                pen   = pg.mkPen(color=color, width=self.line_width_input.value())
+                pen = pg.mkPen(color=data.color,
+                               width=self.line_width_input.value())
 
                 for p_idx, (_, prow) in enumerate(selected.iterrows()):
                     pid = prow['Precursor.Id']
@@ -1077,6 +1483,7 @@ class ChromatogramViewer(QMainWindow):
                     # Temporary per-peptide norm (replaced in Phase 2)
                     tmp = intensity / peak_max * 100 if peak_max > 0 else intensity
                     item = plot.plot(rt_arr, tmp, pen=pen)
+                    self._register_plot_item(item, data.path)
                     plot_items.append((item, rt_arr, intensity))
 
             # Phase 2: rescale with global_max
@@ -1094,20 +1501,6 @@ class ChromatogramViewer(QMainWindow):
                 self._rtqc_redlines.append((line, plot))
                 if self.rtqc_redline_check.isChecked():
                     plot.addItem(line)
-
-            # Save plot items for live line-width update
-            self._current_plot_items = [
-                (item, colors[i % len(colors)])
-                for i, data in enumerate(data_list)
-                for item in [pi[0] for pi in plot_items
-                             if pi[0] in plot.listDataItems()]
-            ]
-            # Simpler: store all items from plot_items with their file index color
-            self._current_plot_items = []
-            fi = 0
-            for ii, (item, rt_arr, intensity) in enumerate(plot_items):
-                # Approximate file index from order
-                self._current_plot_items.append((item, None))  # color managed by pen
 
             self.setup_plot_interaction(plot)
             plot.scene().sigMouseClicked.connect(self.on_double_click)
@@ -1127,7 +1520,7 @@ class ChromatogramViewer(QMainWindow):
 
             # --- Phase 1: calculate XICs, draw with temporary per-peptide 100% ---
             for i, data in enumerate(data_list):
-                plot = self.plot_container.addPlot(row=i, col=0)
+                plot = self.plot_container.addPlot(row=i, col=0, viewBox=ClampedViewBox())
                 plot.setTitle(data.name, size="10pt")
                 plot.setLabel('left', '%')
                 plot.showGrid(x=True, y=True, alpha=0.3)
@@ -1160,9 +1553,11 @@ class ChromatogramViewer(QMainWindow):
 
                     # Temporary: draw per-peptide 100% (will be replaced in Phase2)
                     tmp_norm = intensity / peak_max * 100 if peak_max > 0 else intensity
-                    color = colors[p_idx % len(colors)]
+                    # split表示では色はペプチドごと（ファイル色は overlay 表示で使用）
+                    color = PALETTE[p_idx % len(PALETTE)]
                     pen = pg.mkPen(color=color, width=self.line_width_input.value())
                     item = plot.plot(rt_arr, tmp_norm, pen=pen)
+                    self._register_plot_item(item)
                     plot_items.append((item, rt_arr, intensity))
 
                 if i == len(data_list) - 1:
@@ -1193,9 +1588,6 @@ class ChromatogramViewer(QMainWindow):
                     if self.rtqc_redline_check.isChecked():
                         plot.addItem(line)
 
-            # Save plot items for live line-width update
-            self._current_plot_items = [(item, None) for item, _, _ in plot_items]
-
             # --- X-axis sync across all files ---
             if len(plots) > 1:
                 for j in range(1, len(plots)):
@@ -1223,7 +1615,9 @@ class ChromatogramViewer(QMainWindow):
         for item, _ in getattr(self, '_current_plot_items', []):
             pen = item.opts.get('pen')
             if pen is not None:
-                new_pen = pg.mkPen(pen.color(), width=value)
+                # 色と線種（破線など）は保ったまま太さだけ変更
+                new_pen = pg.mkPen(color=pen.color(), width=value,
+                                   style=pen.style())
                 item.setPen(new_pen)
 
     def _match_run_key(self, data_name: str, run_dict: dict) -> str | None:
@@ -1350,7 +1744,7 @@ class ChromatogramViewer(QMainWindow):
         checked_paths = self.get_checked_paths()
         
         if not checked_paths:
-            self.plot_container.clear()
+            self._clear_plot_area()
             self.status_label.setText("Please select files")
             return
         
@@ -1373,13 +1767,9 @@ class ChromatogramViewer(QMainWindow):
             self.status_label.setText("No files could be loaded")
             return
         
-        self.plot_container.clear()
+        self._clear_plot_area()
         
         overlay = self.overlay_check.isChecked()
-        
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-                  '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
-                  '#FF6600', '#9900FF', '#00CC99', '#FF0066', '#6600FF']
         
         # プロット表示範囲：全ターゲットのRT範囲をカバー
         min_rt = min(rt - w for rt, w in zip(self.multi_xic_rt_list, self.multi_xic_rt_width_list))
@@ -1441,7 +1831,7 @@ class ChromatogramViewer(QMainWindow):
 
             global_max = max((c.max() for c in intensities if len(c) > 0), default=1)
 
-            plot = self.plot_container.addPlot(row=0, col=0)
+            plot = self.plot_container.addPlot(row=0, col=0, viewBox=ClampedViewBox())
             plot.setTitle(mode_name.replace('\n', ' '), size="10pt")
             plot.setLabel('left', 'Intensity', units='%')
             plot.setLabel('bottom', 'Retention Time (min)')
@@ -1450,9 +1840,9 @@ class ChromatogramViewer(QMainWindow):
 
             for i, (data, rt_grid, combined) in enumerate(zip(data_list, rt_grids, intensities)):
                 intensity_norm = combined / global_max * 100 if global_max > 0 else combined
-                color = colors[i % len(colors)]
-                pen = pg.mkPen(color=color, width=self.line_width_input.value())
-                plot.plot(rt_grid, intensity_norm, pen=pen, name=data.name)
+                pen = pg.mkPen(color=data.color, width=self.line_width_input.value())
+                item = plot.plot(rt_grid, intensity_norm, pen=pen, name=data.name)
+                self._register_plot_item(item, data.path)
 
             plot.setXRange(min_rt, max_rt, padding=0.02)
             self.setup_plot_interaction(plot)
@@ -1468,7 +1858,7 @@ class ChromatogramViewer(QMainWindow):
                 max_val = combined.max() if len(combined) > 0 else 0
                 intensity_norm = combined / max_val * 100 if max_val > 0 else combined
 
-                plot = self.plot_container.addPlot(row=i, col=0)
+                plot = self.plot_container.addPlot(row=i, col=0, viewBox=ClampedViewBox())
                 plot.setTitle(data.name, size="10pt")
                 plot.setLabel('left', '%')
                 plot.showGrid(x=True, y=True, alpha=0.3)
@@ -1478,9 +1868,9 @@ class ChromatogramViewer(QMainWindow):
                 else:
                     plot.getAxis('bottom').setStyle(showValues=False)
 
-                color = colors[i % len(colors)]
-                pen = pg.mkPen(color=color, width=self.line_width_input.value())
-                plot.plot(rt_grid, intensity_norm, pen=pen)
+                pen = pg.mkPen(color=data.color, width=self.line_width_input.value())
+                item = plot.plot(rt_grid, intensity_norm, pen=pen)
+                self._register_plot_item(item, data.path)
 
                 self.setup_plot_interaction(plot)
                 plot.setXRange(min_rt, max_rt, padding=0.02)
@@ -1527,28 +1917,80 @@ class ChromatogramViewer(QMainWindow):
             
             for plot in self.current_plots:
                 plot.setXRange(min_rt, max_rt, padding=0)
-                plot.setYRange(0, 105, padding=0)
+            self._reset_y_top()
     
     def setup_plot_interaction(self, plot):
-        """Set up plot interaction"""
+        """Set up plot interaction (Y軸は ClampedViewBox が 0 下限で管理)"""
         vb = plot.getViewBox()
-        
-        # Right drag for range selection -> zoom
+
+        # Rect drag for range selection -> zoom
         vb.setMouseMode(pg.ViewBox.RectMode)
-        
-        # X-axis only zoom
-        vb.setMouseEnabled(x=True, y=False)
-        
-        # Fix Y-axis range
-        vb.setYRange(0, 105, padding=0)
-        vb.enableAutoRange(axis='y', enable=False)
-        
-        # Force reset Y-axis on range change
-        def on_range_changed():
-            vb.setYRange(0, 105, padding=0)
-        
-        vb.sigRangeChanged.connect(on_range_changed)
-                
+
+        if isinstance(vb, ClampedViewBox):
+            # 現在のY上限に合わせてから登録
+            vb.set_y_top(self._y_top, emit=False)
+            vb.sigYTopChanged.connect(self._on_y_top_changed)
+            if vb not in self._clamped_vbs:
+                self._clamped_vbs.append(vb)
+        else:
+            # フォールバック（ClampedViewBox 以外）
+            vb.setMouseEnabled(x=True, y=False)
+            vb.enableAutoRange(axis='y', enable=False)
+            vb.setYRange(0, self._y_top, padding=0)
+
+    # ── Y軸スケーリング ─────────────────────────────────────────
+
+    def _clear_plot_area(self):
+        """プロット領域をクリアし、各レジストリもリセットする"""
+        self._clamped_vbs        = []
+        self._current_plot_items = []
+        self._file_plot_items    = {}
+        self._rtqc_redlines      = []
+        self.plot_container.clear()
+
+    def _register_plot_item(self, item, path=None):
+        """描画したラインを登録する（線幅・色のライブ更新用）
+
+        path を渡した項目は、その色ボタンから色を変更できるようになる。
+        """
+        self._current_plot_items.append((item, path))
+        if path is not None:
+            self._file_plot_items.setdefault(path, []).append(item)
+        return item
+
+    def _on_y_top_changed(self, top):
+        """いずれかのプロットでホイール操作 → 全プロット + UI を同期"""
+        if self._y_sync_guard:
+            return
+        self._y_sync_guard = True
+        try:
+            self._y_top = top
+            for vb in self._clamped_vbs:
+                vb.set_y_top(top, emit=False)
+            self.y_top_input.blockSignals(True)
+            self.y_top_input.setValue(top)
+            self.y_top_input.blockSignals(False)
+        finally:
+            self._y_sync_guard = False
+
+    def _set_y_top_from_ui(self, value):
+        """右パネルのスピンボックスからY軸上限を設定"""
+        if self._y_sync_guard:
+            return
+        self._y_sync_guard = True
+        try:
+            self._y_top = float(value)
+            for vb in self._clamped_vbs:
+                vb.set_y_top(self._y_top, emit=False)
+        finally:
+            self._y_sync_guard = False
+
+    def _reset_y_top(self):
+        """Y軸を初期範囲 (0–105%) に戻す"""
+        self.y_top_input.setValue(ClampedViewBox.Y_TOP_MAX)
+        self._set_y_top_from_ui(ClampedViewBox.Y_TOP_MAX)
+
+    
     def update_plot(self):
         """Update plot"""
         _t_start = time.perf_counter()
@@ -1564,7 +2006,7 @@ class ChromatogramViewer(QMainWindow):
         checked_paths = self.get_checked_paths()
         
         if not checked_paths:
-            self.plot_container.clear()
+            self._clear_plot_area()
             self.status_label.setText("Please select files")
             return
         
@@ -1599,7 +2041,7 @@ class ChromatogramViewer(QMainWindow):
                 self.status_label.setText("No MS2 data available")
                 return
         
-        self.plot_container.clear()
+        self._clear_plot_area()
         
         target_mz = self.mz_input.value()
         ppm = self.ppm_input.value()
@@ -1623,10 +2065,6 @@ class ChromatogramViewer(QMainWindow):
         elif mode == 4:
             mode_name = "BPI (MS2)"
         
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-                  '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
-                  '#FF6600', '#9900FF', '#00CC99', '#FF0066', '#6600FF']
-        
         # Get RT range (different for MS1/MS2)
         if mode in [3, 4]:
             max_rt = max(data.rt_ms2.max() for data in data_list)
@@ -1645,7 +2083,7 @@ class ChromatogramViewer(QMainWindow):
         else:
             self.plot_container.setMinimumHeight(0)
             # オーバーレイ用プロットを先に作成
-            plot_overlay = self.plot_container.addPlot(row=0, col=0)
+            plot_overlay = self.plot_container.addPlot(row=0, col=0, viewBox=ClampedViewBox())
             plot_overlay.setTitle(mode_name.replace('\n', ' '), size="10pt")
             plot_overlay.setLabel('left', 'Intensity', units='%')
             plot_overlay.setLabel('bottom', 'Retention Time (min)')
@@ -1682,8 +2120,7 @@ class ChromatogramViewer(QMainWindow):
             intensities.append(intensity)
             rt_arrays.append(rt_arr)
 
-            color = colors[i % len(colors)]
-            pen = pg.mkPen(color=color, width=self.line_width_input.value())
+            pen = pg.mkPen(color=data.color, width=self.line_width_input.value())
 
             # 仮描画（個別100%正規化）
             max_val = intensity.max() if len(intensity) > 0 else 0
@@ -1695,9 +2132,10 @@ class ChromatogramViewer(QMainWindow):
 
             if overlay:
                 item = plot_overlay.plot(rt_arr, intensity_norm, pen=pen, name=data.name)
+                self._register_plot_item(item, data.path)
                 plot_items.append(item)
             else:
-                plot = self.plot_container.addPlot(row=i, col=0)
+                plot = self.plot_container.addPlot(row=i, col=0, viewBox=ClampedViewBox())
                 plot.setTitle(data.name, size="10pt")
                 plot.setLabel('left', '%')
                 plot.showGrid(x=True, y=True, alpha=0.3)
@@ -1706,6 +2144,7 @@ class ChromatogramViewer(QMainWindow):
                 else:
                     plot.getAxis('bottom').setStyle(showValues=False)
                 item = plot.plot(rt_arr, intensity_norm, pen=pen)
+                self._register_plot_item(item, data.path)
                 plot_items.append(item)
                 self.setup_plot_interaction(plot)
                 plot.setXRange(plot_min_rt, plot_max_rt, padding=0.02)
@@ -1755,7 +2194,7 @@ class ChromatogramViewer(QMainWindow):
             self.status_label.setText("Pump data not found")
             return
         
-        self.plot_container.clear()
+        self._clear_plot_area()
         
         overlay = self.overlay_check.isChecked()
         
@@ -1770,8 +2209,7 @@ class ChromatogramViewer(QMainWindow):
         min_rt = min(all_rts)
         max_rt = max(all_rts)
         
-        colors_a = ['#1f77b4', '#2ca02c', '#9467bd', '#17becf', '#bcbd22']  # Blue series
-        colors_b = ['#ff7f0e', '#d62728', '#e377c2', '#8c564b', '#FF6600']  # Red series
+        # ポンプA = ファイル色（実線）/ ポンプB = 同色の破線
         
         if overlay:
             self.plot_container.setMinimumHeight(0)
@@ -1785,17 +2223,19 @@ class ChromatogramViewer(QMainWindow):
             
             for i, data in enumerate(data_list):
                 if data.pump_a_rt is not None:
-                    pen_a = pg.mkPen(color=colors_a[i % len(colors_a)], 
+                    pen_a = pg.mkPen(color=data.color,
                                      width=self.line_width_input.value())
-                    plot.plot(data.pump_a_rt, data.pump_a_pressure, 
+                    item = plot.plot(data.pump_a_rt, data.pump_a_pressure, 
                              pen=pen_a, name=f"{data.name} - Pump A")
+                    self._register_plot_item(item, data.path)
                 
                 if data.pump_b_rt is not None:
-                    pen_b = pg.mkPen(color=colors_b[i % len(colors_b)], 
+                    pen_b = pg.mkPen(color=data.color,
                                      width=self.line_width_input.value(),
                                      style=Qt.PenStyle.DashLine)
-                    plot.plot(data.pump_b_rt, data.pump_b_pressure, 
+                    item = plot.plot(data.pump_b_rt, data.pump_b_pressure, 
                              pen=pen_b, name=f"{data.name} - Pump B")
+                    self._register_plot_item(item, data.path)
             
             plot.setXRange(min_rt, max_rt, padding=0)
             
@@ -1825,15 +2265,19 @@ class ChromatogramViewer(QMainWindow):
                     plot.getAxis('bottom').setStyle(showValues=False)
                 
                 if data.pump_a_rt is not None:
-                    pen_a = pg.mkPen(color='#1f77b4', width=self.line_width_input.value())
-                    plot.plot(data.pump_a_rt, data.pump_a_pressure, 
+                    pen_a = pg.mkPen(color=data.color,
+                                     width=self.line_width_input.value())
+                    item = plot.plot(data.pump_a_rt, data.pump_a_pressure, 
                              pen=pen_a, name="Pump A")
+                    self._register_plot_item(item, data.path)
                 
                 if data.pump_b_rt is not None:
-                    pen_b = pg.mkPen(color='#ff7f0e', width=self.line_width_input.value(),
-                                    style=Qt.PenStyle.DashLine)
-                    plot.plot(data.pump_b_rt, data.pump_b_pressure, 
+                    pen_b = pg.mkPen(color=data.color,
+                                     width=self.line_width_input.value(),
+                                     style=Qt.PenStyle.DashLine)
+                    item = plot.plot(data.pump_b_rt, data.pump_b_pressure, 
                              pen=pen_b, name="Pump B")
+                    self._register_plot_item(item, data.path)
                 
                 plot.setXRange(min_rt, max_rt, padding=0)
                 
